@@ -224,7 +224,7 @@ def callback(chat_id, data, cq_id, msg_id=None):
 HELP = (
     "<b>Swarm Watch</b> · unofficial, read-only, public data only.\n\n"
     "/watch 7 1234 — watch these NFT seats\n"
-    "/unwatch 51 — stop watching (or /unwatch all)\n"
+    "/unwatch 7 — stop watching (or /unwatch all)\n"
     "/list — what you watch\n"
     "/status — your seats right now\n"
     "/network — the swarm right now\n"
@@ -307,11 +307,11 @@ def cmd(chat_id, text):
             if not mine:
                 return send(chat_id, "You watch nothing yet.")
             set_pending(chat_id, "unwatch")
-            return send(chat_id, "You watch " + ", ".join(f"#{t}" for t in mine) + ". Which ones to drop? Type the numbers, or <code>all</code>.", ask="51")
+            return send(chat_id, "You watch " + ", ".join(f"#{t}" for t in mine) + ". Which ones to drop? Type the numbers, or <code>all</code>.", ask="7")
         set_pending(chat_id, None)
         do_unwatch(chat_id, ids)
     elif c0 == "/list":
-        send(chat_id, "You watch: " + (", ".join(f"#{t}" for t in my_subs(chat_id)) or "nothing yet. /watch 51"))
+        send(chat_id, "You watch: " + (", ".join(f"#{t}" for t in my_subs(chat_id)) or "nothing yet. /watch 7"))
     elif c0 == "/status":
         status(chat_id, my_subs(chat_id))
     elif c0 == "/network":
