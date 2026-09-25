@@ -1,0 +1,57 @@
+#!/bin/sh
+# Operator-side alerts for IdentityMD nodes: runs `imd doctor` for each worker user and
+# sends what the network says about the machine (pause, failed runs, presence) plus
+# disk and service state to one Telegram chat. Meant for root cron, hourly.
+#
+# Config: /etc/swarmwatch/token (bot token), /etc/swarmwatch/admin (chat id),
+#         IMD_USERS="imd1 imd2" (worker users), cooldown state in /var/lib/imd-doctor-alert.
+set -u
+IMD_USERS="${IMD_USERS:-imd1 imd2}"
+DRY="${DRY_RUN:-}"
+TOKEN=$(cat /etc/swarmwatch/token 2>/dev/null) || TOKEN=""
+CHAT=$(cat /etc/swarmwatch/admin 2>/dev/null) || CHAT=""
+[ -n "$DRY" ] || [ -n "$TOKEN$CHAT" ] || exit 0
+STATE=/var/lib/imd-doctor-alert; mkdir -p "$STATE"
+HOST=$(hostname -s)
+problems=""; details=""
+
+disk=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+[ "$disk" -ge 90 ] && problems="$problems
+• disk ${disk}% full"
+
+for u in $IMD_USERS; do
+  uid=$(id -u "$u" 2>/dev/null) || continue
+  run="sudo -iu $u env XDG_RUNTIME_DIR=/run/user/$uid"
+  active=$($run systemctl --user is-active identitymd-worker 2>/dev/null)
+  [ "$active" = "active" ] || problems="$problems
+• $u: service $active"
+  out=$($run timeout 180 imd doctor 2>&1)
+  standing=$(printf '%s\n' "$out" | grep -E '^\s*[✓✗!]?\s*standing' | head -1)
+  presence=$(printf '%s\n' "$out" | grep -E '^\s*[✓✗!]?\s*presence' | head -1)
+  release=$(printf '%s\n' "$out" | grep -E '^\s*[✓✗!]?\s*release' | head -1)
+  failed=$(printf '%s' "$standing" | grep -oE '[0-9]+ failed runs' | grep -oE '[0-9]+'); failed=${failed:-0}
+  if printf '%s' "$standing" | grep -qiE 'paused|pause until|on pause'; then problems="$problems
+• $u: PAUSED by the control plane"; fi
+  [ "$failed" -ge 3 ] && problems="$problems
+• $u: $failed failed runs in the last day"
+  printf '%s' "$presence" | grep -q 'connected' || problems="$problems
+• $u: not connected ($presence)"
+  printf '%s' "$release" | grep -q 'the latest' || problems="$problems
+• $u: $release"
+  # the failure lines doctor prints under standing
+  fl=$(printf '%s\n' "$out" | sed -n '/standing/,/queue/p' | grep -E '^\s+[0-9]{2}:[0-9]{2} ' | head -5)
+  [ -n "$fl" ] && details="$details
+$u:
+$fl"
+done
+
+[ -n "$DRY" ] && { printf 'problems:%s\ndetails:%s\n' "$problems" "$details"; exit 0; }
+[ -z "$problems" ] && { rm -f "$STATE/last"; exit 0; }
+msg="⚠️ $HOST$problems
+$details"
+sum=$(printf '%s' "$msg" | md5sum | cut -c1-32)
+# same problem set: repeat at most every 6 h
+if [ -f "$STATE/last" ] && [ "$(cat "$STATE/last")" = "$sum" ] && [ -n "$(find "$STATE/last" -mmin -360)" ]; then exit 0; fi
+printf '%s' "$sum" > "$STATE/last"
+curl -sS -m 20 -o /dev/null -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+  --data-urlencode "chat_id=$CHAT" --data-urlencode "text=$msg" --data-urlencode "disable_web_page_preview=true"
