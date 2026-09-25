@@ -3,7 +3,7 @@
 A Telegram bot that watches IdentityMD swarm seats from public data. Unofficial,
 read-only. It never asks for keys, wallets or access to anyone's machine.
 
-**Bot:** see the link in the `awesome-imd` list once it is published.
+**Bot:** [@imd_swarm_watch_bot](https://t.me/imd_swarm_watch_bot)
 
 ```
 /watch 7 1234     watch these NFT seats
