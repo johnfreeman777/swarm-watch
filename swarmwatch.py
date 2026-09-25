@@ -60,8 +60,10 @@ def tg(method, **params):
         log("telegram", method, "error", e)
         return {"ok": False, "description": str(e)}
 
-def send(chat_id, text, silent=False):
-    r = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, disable_notification=silent)
+def send(chat_id, text, silent=False, ask=None):
+    """ask: placeholder text; opens the reply field so the user can just type an answer."""
+    extra = {"reply_markup": {"force_reply": True, "input_field_placeholder": ask}} if ask else {}
+    r = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, disable_notification=silent, **extra)
     if not r.get("ok") and r.get("error_code") in (403, 400):  # blocked the bot or chat gone: drop them
         with db() as c:
             c.execute("DELETE FROM subs WHERE chat_id=?", (chat_id,))
@@ -85,6 +87,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS alerts (chat_id INTEGER, token_id TEXT, kind TEXT, last_sent INTEGER, state TEXT, PRIMARY KEY (chat_id, token_id, kind));
         CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
         CREATE TABLE IF NOT EXISTS news_seen (h TEXT PRIMARY KEY, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS pending (chat_id INTEGER PRIMARY KEY, action TEXT, ts INTEGER);
         """)
 
 def kv_get(k, default=None):
@@ -188,7 +191,7 @@ def network_line():
 HELP = (
     "<b>Swarm Watch</b> · unofficial, read-only, public data only.\n\n"
     "/watch 7 1234 — watch these NFT seats\n"
-    "/unwatch 51 — stop watching\n"
+    "/unwatch 51 — stop watching (or /unwatch all)\n"
     "/list — what you watch\n"
     "/status — your seats right now\n"
     "/network — the swarm right now\n"
@@ -200,6 +203,42 @@ HELP = (
 )
 
 # ---------- commands ----------
+def set_pending(chat_id, action):
+    with db() as c:
+        if action:
+            c.execute("INSERT OR REPLACE INTO pending VALUES (?,?,?)", (chat_id, action, int(time.time())))
+        else:
+            c.execute("DELETE FROM pending WHERE chat_id=?", (chat_id,))
+
+def get_pending(chat_id):
+    with db() as c:
+        r = c.execute("SELECT action, ts FROM pending WHERE chat_id=?", (chat_id,)).fetchone()
+    return r["action"] if r and time.time() - r["ts"] < 3600 else None
+
+def do_watch(chat_id, ids):
+    with db() as c:
+        for t in ids:
+            c.execute("INSERT OR IGNORE INTO subs VALUES (?,?,?)", (chat_id, t, int(time.time())))
+    with net_lock:
+        known = [t for t in ids if t in seats]
+    unknown = [t for t in ids if t not in known]
+    msg = "Watching " + ", ".join(f"#{t}" for t in ids) + "."
+    if unknown:
+        msg += "\nNot seen on the network yet: " + ", ".join(f"#{t}" for t in unknown) + " (it must be paired and have taken at least one task)."
+    send(chat_id, msg)
+    if known:
+        status(chat_id, known)
+
+def do_unwatch(chat_id, ids, everything=False):
+    with db() as c:
+        if everything:
+            c.execute("DELETE FROM subs WHERE chat_id=?", (chat_id,))
+            c.execute("DELETE FROM alerts WHERE chat_id=?", (chat_id,))
+        else:
+            c.executemany("DELETE FROM subs WHERE chat_id=? AND token_id=?", [(chat_id, t) for t in ids])
+            c.executemany("DELETE FROM alerts WHERE chat_id=? AND token_id=?", [(chat_id, t) for t in ids])
+    send(chat_id, "Done. You watch: " + (", ".join(f"#{t}" for t in my_subs(chat_id)) or "nothing."))
+
 def parse_ids(args):
     out = []
     for a in args:
@@ -221,29 +260,23 @@ def cmd(chat_id, text):
     elif c0 == "/watch":
         ids = parse_ids(args)
         if not ids:
-            return send(chat_id, "Give NFT numbers, e.g. <code>/watch 7 1234</code>")
-        with db() as c:
-            for t in ids:
-                c.execute("INSERT OR IGNORE INTO subs VALUES (?,?,?)", (chat_id, t, int(time.time())))
-        with net_lock:
-            known = [t for t in ids if t in seats]
-        unknown = [t for t in ids if t not in known]
-        msg = "Watching " + ", ".join(f"#{t}" for t in ids) + "."
-        if unknown:
-            msg += "\nNot seen on the network yet: " + ", ".join(f"#{t}" for t in unknown) + " (it must be paired and have taken at least one task)."
-        send(chat_id, msg)
-        if known:
-            status(chat_id, known)
+            set_pending(chat_id, "watch")
+            return send(chat_id, "Which NFT numbers? Type them separated by spaces, e.g. <code>7 1234</code>", ask="7 1234")
+        set_pending(chat_id, None)
+        do_watch(chat_id, ids)
     elif c0 == "/unwatch":
         ids = parse_ids(args)
-        with db() as c:
-            if ids:
-                c.executemany("DELETE FROM subs WHERE chat_id=? AND token_id=?", [(chat_id, t) for t in ids])
-                c.executemany("DELETE FROM alerts WHERE chat_id=? AND token_id=?", [(chat_id, t) for t in ids])
-            else:
-                c.execute("DELETE FROM subs WHERE chat_id=?", (chat_id,))
-                c.execute("DELETE FROM alerts WHERE chat_id=?", (chat_id,))
-        send(chat_id, "Done.")
+        if args and args[0].lower() == "all":
+            set_pending(chat_id, None)
+            return do_unwatch(chat_id, [], everything=True)
+        if not ids:
+            mine = my_subs(chat_id)
+            if not mine:
+                return send(chat_id, "You watch nothing yet.")
+            set_pending(chat_id, "unwatch")
+            return send(chat_id, "You watch " + ", ".join(f"#{t}" for t in mine) + ". Which ones to drop? Type the numbers, or <code>all</code>.", ask="51")
+        set_pending(chat_id, None)
+        do_unwatch(chat_id, ids)
     elif c0 == "/list":
         send(chat_id, "You watch: " + (", ".join(f"#{t}" for t in my_subs(chat_id)) or "nothing yet. /watch 51"))
     elif c0 == "/status":
@@ -262,6 +295,22 @@ def cmd(chat_id, text):
         send(chat_id, f"{c0[1:]} {'on' if on else 'off'}.")
     else:
         send(chat_id, HELP)
+
+def plain(chat_id, text):
+    """Text without a slash: the answer to a /watch or /unwatch prompt, or just NFT numbers."""
+    action = get_pending(chat_id)
+    ids = parse_ids(text.replace(",", " ").split())
+    if action == "unwatch":
+        set_pending(chat_id, None)
+        if text.strip().lower() == "all":
+            return do_unwatch(chat_id, [], everything=True)
+        return do_unwatch(chat_id, ids) if ids else send(chat_id, "No numbers there. Use /unwatch again when ready.")
+    if ids:
+        set_pending(chat_id, None)
+        return do_watch(chat_id, ids)
+    if action == "watch":
+        return send(chat_id, "I need NFT numbers, e.g. <code>7 1234</code>", ask="7 1234")
+    send(chat_id, HELP)
 
 def my_subs(chat_id):
     with db() as c:
@@ -435,12 +484,16 @@ def updates_loop():
             m = u.get("message") or {}
             text = m.get("text")
             chat = (m.get("chat") or {}).get("id")
-            if text and chat is not None and text.startswith("/"):
-                try:
+            if not text or chat is None:
+                continue
+            try:
+                if text.startswith("/"):
                     cmd(chat, text)
-                except Exception as e:
-                    log("cmd failed", text, e)
-                    send(chat, "Something broke on my side; try again in a minute.")
+                else:
+                    plain(chat, text)
+            except Exception as e:
+                log("cmd failed", text, e)
+                send(chat, "Something broke on my side; try again in a minute.")
 
 if __name__ == "__main__":
     init_db()
