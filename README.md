@@ -56,18 +56,26 @@ systemctl enable --now swarmwatch
 
 ## Operator alerts (`imd-doctor-alert`)
 
-For the machine that runs your nodes. Hourly from root cron, it runs `imd doctor` for
-each worker user and sends only real problems to one chat: a pause from the control
-plane, three or more failed runs in a day, a disconnected daemon, a stale release, a
-stopped service, a full disk. It repeats the same problem set at most every six hours
-and says nothing when everything is fine.
+For the machine that runs your nodes. What the network says about a machine (a pause,
+the failed runs and their reasons) is shown only to that machine by `imd doctor`, so no
+public bot can watch it for you. This script does it locally: hourly from root cron, it
+runs `imd doctor` for each worker user and sends only real problems to your Telegram: a
+pause from the control plane, three or more failed runs in a day, a disconnected daemon,
+a stale release, a stopped service, a full disk. It repeats the same problem set at most
+every six hours and says nothing when everything is fine.
+
+It works with **your own** bot, so you never share a token with anyone: make one at
+@BotFather (one minute), send it `/start`, get your chat id from @userinfobot.
 
 ```sh
-cp imd-doctor-alert /usr/local/bin/ && chmod +x /usr/local/bin/imd-doctor-alert
-echo "<your chat id>" > /etc/swarmwatch/admin      # from @userinfobot
+curl -fsSLO https://raw.githubusercontent.com/johnfreeman777/swarm-watch/main/imd-doctor-alert
+install -m 755 imd-doctor-alert /usr/local/bin/
+umask 077; printf 'TOKEN=%s\nCHAT=%s\n' "<bot token>" "<chat id>" > /etc/imd-doctor-alert.conf
+DRY_RUN=1 IMD_USERS="imd1 imd2" /usr/local/bin/imd-doctor-alert      # prints what it would send
 echo '17 * * * * root IMD_USERS="imd1 imd2" /usr/local/bin/imd-doctor-alert' > /etc/cron.d/imd-doctor-alert
 ```
 
-It reuses the same bot token, so one bot serves both the public and your own alerts.
+Replace `imd1 imd2` with the users your daemons run as (one user per NFT, as in the
+[node guide](https://github.com/johnfreeman777/imd-node-guide)).
 
 Not affiliated with the IdentityMD developer.

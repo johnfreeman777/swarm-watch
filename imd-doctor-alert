@@ -3,13 +3,20 @@
 # sends what the network says about the machine (pause, failed runs, presence) plus
 # disk and service state to one Telegram chat. Meant for root cron, hourly.
 #
-# Config: /etc/swarmwatch/token (bot token), /etc/swarmwatch/admin (chat id),
-#         IMD_USERS="imd1 imd2" (worker users), cooldown state in /var/lib/imd-doctor-alert.
+# Standalone: works with ANY Telegram bot token, so every operator uses their own bot
+# (one minute at @BotFather) and never shares a token with anyone.
+# Config: /etc/imd-doctor-alert.conf with two lines
+#   TOKEN=123456:abc...      bot token from @BotFather
+#   CHAT=123456789           your chat id (@userinfobot)
+# Optional: IMD_USERS="imd1 imd2" (worker users; default below), DRY_RUN=1 to print instead of send.
 set -u
 IMD_USERS="${IMD_USERS:-imd1 imd2}"
 DRY="${DRY_RUN:-}"
-TOKEN=$(cat /etc/swarmwatch/token 2>/dev/null) || TOKEN=""
-CHAT=$(cat /etc/swarmwatch/admin 2>/dev/null) || CHAT=""
+TOKEN=""; CHAT=""
+[ -r /etc/imd-doctor-alert.conf ] && . /etc/imd-doctor-alert.conf
+# fallback for a box that also runs the Swarm Watch bot
+[ -n "$TOKEN" ] || TOKEN=$(cat /etc/swarmwatch/token 2>/dev/null) || TOKEN=""
+[ -n "$CHAT" ] || CHAT=$(cat /etc/swarmwatch/admin 2>/dev/null) || CHAT=""
 [ -n "$DRY" ] || [ -n "$TOKEN$CHAT" ] || exit 0
 STATE=/var/lib/imd-doctor-alert; mkdir -p "$STATE"
 HOST=$(hostname -s)
