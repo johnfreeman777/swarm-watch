@@ -9,6 +9,8 @@ read-only. It never asks for keys, wallets or access to anyone's machine.
 /watch 7 1234     watch these NFT seats
 /status            your seats right now: rank, accepted, rejected, pending, last work
 /network           the swarm right now: online, accepted in 24 h, paid orders
+/allocations       launch tokens allocated to your seats' wallets, claimed or not, with claim links
+/drops             IMD that arrived in those wallets (the dev's airdrops to active nodes)
 /digest on|off     daily summary at 08:00 UTC
 /news on|off       the dev's on-chain messages as they land
 ```
@@ -22,6 +24,12 @@ Alerts, per watched seat:
   network is quiet, silence is normal and nothing fires.
 - **rejections** — three or more new rejections within a day.
 - **gone** — the seat disappeared from the network's contributor list.
+- **allocation** — a new launch allocated tokens to the seat's wallet (amount, share, claim
+  link), and a note when it gets claimed. From the
+  [Swarm Ledger](https://johnfreeman777.github.io/swarm-ledger/) snapshot, every 30 min.
+- **drop** — IMD arrived in the seat's wallet on mainnet, e.g. the dev's airdrops to active
+  nodes. Each watched wallet's incoming IMD transfers are read from a public explorer, a few
+  wallets a minute in rotation; history seen before you subscribed is never announced.
 
 What it cannot see: pauses from the control plane and the reasons behind failed runs.
 Those are shown only to the node itself by `imd doctor`. For that there is

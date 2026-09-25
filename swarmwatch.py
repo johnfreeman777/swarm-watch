@@ -26,6 +26,10 @@ API = "https://api.imd.fun"
 EXPLORER = "https://explorer.imd.fun"
 OWNER = "0x200e710acaa6a93bbc77146026328c40f1d60fb1"  # publishes the project's on-chain messages
 BLOCKSCOUT = "https://eth.blockscout.com/api/v2"
+IMD = "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7"          # the token airdrops arrive in (mainnet)
+LEDGER = "https://johnfreeman777.github.io/swarm-ledger/data/snapshot.json"  # launches, allocations, claim status
+DROPS_POLL_S = 60
+LEDGER_POLL_S = 30 * 60
 POLL_S = 60            # network poll
 NEWS_POLL_S = 120      # on-chain messages poll
 WINDOW_S = 2 * 3600    # "stalled" window
@@ -89,6 +93,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
         CREATE TABLE IF NOT EXISTS news_seen (h TEXT PRIMARY KEY, ts INTEGER);
         CREATE TABLE IF NOT EXISTS pending (chat_id INTEGER PRIMARY KEY, action TEXT, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS drops_seen (tx TEXT, wallet TEXT, ts INTEGER, PRIMARY KEY (tx, wallet));
+        CREATE TABLE IF NOT EXISTS alloc_seen (chat_id INTEGER, launch INTEGER, wallet TEXT, claimed INTEGER, PRIMARY KEY (chat_id, launch, wallet));
         """)
 
 def kv_get(k, default=None):
@@ -167,6 +173,58 @@ def fleet_active_share(now):
 def h(s):
     return html.escape(str(s))
 
+def wallet_of(token_id):
+    with net_lock:
+        s = seats.get(token_id)
+    return s["wallet"] if s else None
+
+def watched_wallets():
+    """wallet -> [(chat_id, token_id), ...] for every subscription whose seat is known."""
+    out = {}
+    with db() as c:
+        subs = c.execute("SELECT chat_id, token_id FROM subs").fetchall()
+    for r in subs:
+        w = wallet_of(r["token_id"])
+        if w:
+            out.setdefault(w, []).append((r["chat_id"], r["token_id"]))
+    return out
+
+def fmt_amount(raw, decimals=18, digits=2):
+    try:
+        v = int(raw) / 10 ** int(decimals)
+    except Exception:
+        return "?"
+    return f"{v:,.{digits}f}" if v < 1000 else f"{v:,.0f}"
+
+ledger = {"launches": [], "at": 0}
+def load_ledger():
+    d = get_json(LEDGER)
+    ledger["launches"] = d.get("launches", [])
+    ledger["at"] = int(time.time())
+    return True
+
+def launch_void(l):
+    return not l.get("distributor") and l.get("status") != "live"
+
+def allocations_for(wallet):
+    """(launch, allocation) pairs for a wallet, live launches with a distributor only."""
+    out = []
+    for l in ledger["launches"]:
+        if launch_void(l) or not l.get("distributor"):
+            continue
+        for a in l.get("allocations", []):
+            if a.get("wallet") == wallet:
+                out.append((l, a))
+    return out
+
+def alloc_line(l, a):
+    t = l.get("token") or {}
+    amount = fmt_amount(a.get("amount", "0"), t.get("decimals", 18), 0)
+    where = f'<a href="{h(l["site"])}">claim page</a>' if l.get("site") else f'distributor <code>{h(l["distributor"])}</code>'
+    net = "" if l.get("chainId") == 1 else " · testnet"
+    state = "claimed ✅" if a.get("claimed") is True else "unclaimed" if a.get("claimed") is False else "claim status unknown"
+    return f"No. {int(l['number']):04d} {h(t.get('name') or '—')} <b>{amount} {h(t.get('symbol') or '')}</b> ({int(a.get('bps', 0)) / 100:.2f}%) · {state} · {where}{net}"
+
 def ago(ts):
     if not ts:
         return "never"
@@ -195,6 +253,7 @@ def keyboard(chat_id):
     digest_on, news_on = (r["digest"], r["news"]) if r else (1, 1)
     return {"inline_keyboard": [
         [{"text": "📊 Status", "callback_data": "status"}, {"text": "🌐 Network", "callback_data": "network"}],
+        [{"text": "🎁 Allocations", "callback_data": "allocations"}, {"text": "💸 IMD drops", "callback_data": "drops"}],
         [{"text": "➕ Watch", "callback_data": "watch"}, {"text": "➖ Unwatch", "callback_data": "unwatch"}],
         [{"text": f"{'🔔' if digest_on else '🔕'} Daily digest: {'on' if digest_on else 'off'}", "callback_data": "digest"},
          {"text": f"{'📡' if news_on else '📴'} Dev news: {'on' if news_on else 'off'}", "callback_data": "news"}],
@@ -210,7 +269,7 @@ def toggle(chat_id, field):
 
 def callback(chat_id, data, cq_id, msg_id=None):
     """Inline button presses map onto the same actions as the commands."""
-    if data in ("status", "network", "watch", "unwatch"):
+    if data in ("status", "network", "watch", "unwatch", "allocations", "drops"):
         tg("answerCallbackQuery", callback_query_id=cq_id)
         cmd(chat_id, "/" + data)
     elif data in ("digest", "news"):
@@ -228,9 +287,12 @@ HELP = (
     "/list — what you watch\n"
     "/status — your seats right now\n"
     "/network — the swarm right now\n"
+    "/allocations — launch tokens allocated to your seats, claimed or not\n"
+    "/drops — IMD that arrived in your seats' wallets (airdrops from the dev)\n"
     "/digest on|off — daily summary at 08:00 UTC\n"
     "/news on|off — the dev's on-chain messages as they land\n\n"
-    "Alerts: a seat that took no work for 2 h while most of the fleet did; 3+ new rejections in a day; a seat that disappears from the network. "
+    "Alerts: a seat that took no work for 2 h while most of the fleet did; 3+ new rejections in a day; a seat that disappears from the network; "
+    "a new launch allocation to your seat's wallet (and when it is claimed); IMD arriving in that wallet. "
     "Pauses and failure reasons are only visible to the node itself (imd doctor); this bot infers from public counts.\n"
     "Source: github.com/johnfreeman777/swarm-watch"
 )
@@ -259,8 +321,61 @@ def do_watch(chat_id, ids):
     if unknown:
         msg += "\nNot seen on the network yet: " + ", ".join(f"#{t}" for t in unknown) + " (it must be paired and have taken at least one task)."
     send(chat_id, msg)
+    for t in known:  # already-known allocations are not news to a new subscriber
+        prime_allocs(chat_id, t)
     if known:
         status(chat_id, known)
+
+def prime_allocs(chat_id, token_id):
+    w = wallet_of(token_id)
+    if not w:
+        return
+    with db() as c:
+        for l, a in allocations_for(w):
+            c.execute("INSERT OR IGNORE INTO alloc_seen VALUES (?,?,?,?)", (chat_id, int(l["number"]), w, 1 if a.get("claimed") else 0))
+
+def cmd_allocations(chat_id):
+    ids = my_subs(chat_id)
+    if not ids:
+        return send(chat_id, "You watch nothing yet. Press Watch or type the NFT numbers.", keys=True)
+    lines = []
+    for t in ids:
+        w = wallet_of(t)
+        al = allocations_for(w) if w else []
+        lines.append(f"<b>#{h(t)}</b> · " + (f"{len(al)} allocation{'s' if len(al) != 1 else ''}" if al else "no allocations yet"))
+        for l, a in sorted(al, key=lambda x: -int(x[0]["number"]))[:8]:
+            lines.append("  " + alloc_line(l, a))
+        if len(al) > 8:
+            lines.append(f"  … and {len(al) - 8} more on the ledger")
+    lines.append('Full history per wallet: <a href="https://johnfreeman777.github.io/swarm-ledger/">Swarm Ledger</a>')
+    send(chat_id, "\n".join(lines), keys=True)
+
+def cmd_drops(chat_id):
+    """Last IMD transfers received by the watched wallets (on demand, from the explorer)."""
+    ids = my_subs(chat_id)
+    if not ids:
+        return send(chat_id, "You watch nothing yet. Press Watch or type the NFT numbers.", keys=True)
+    lines, seen = [], set()
+    for t in ids:
+        w = wallet_of(t)
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        try:
+            d = get_json(f"{BLOCKSCOUT}/addresses/{w}/token-transfers?type=ERC-20&filter=to&token={IMD}")
+        except Exception as e:
+            lines.append(f"<b>#{h(t)}</b> · explorer unavailable ({h(str(e)[:60])})")
+            continue
+        items = [x for x in d.get("items", []) if (x.get("to") or {}).get("hash", "").lower() == w][:6]
+        who = ", ".join(f"#{h(x)}" for x in ids if wallet_of(x) == w)
+        lines.append(f"<b>{who}</b> · wallet <code>{h(w[:6] + '…' + w[-4:])}</code>")
+        if not items:
+            lines.append("  no IMD received yet")
+        for x in items:
+            frm = (x.get("from") or {})
+            src = frm.get("name") or (frm.get("hash") or "")[:6] + "…"
+            lines.append(f"  +{fmt_amount(x['total']['value'], x['total'].get('decimals', 18))} IMD · {h(src)} · {h((x.get('timestamp') or '')[:10])} · <a href=\"https://etherscan.io/tx/{h(x['transaction_hash'])}\">tx</a>")
+    send(chat_id, "\n".join(lines), keys=True)
 
 def do_unwatch(chat_id, ids, everything=False):
     with db() as c:
@@ -316,6 +431,10 @@ def cmd(chat_id, text):
         status(chat_id, my_subs(chat_id))
     elif c0 == "/network":
         send(chat_id, network_line(), keys=True)
+    elif c0 == "/allocations":
+        cmd_allocations(chat_id)
+    elif c0 == "/drops":
+        cmd_drops(chat_id)
     elif c0 in ("/digest", "/news"):
         on = (args[0].lower() if args else "") in ("on", "1", "yes")
         off = (args[0].lower() if args else "") in ("off", "0", "no")
@@ -357,7 +476,15 @@ def status(chat_id, ids):
         snap = {t: dict(seats[t]) for t in ids if t in seats}
     for t in ids:
         s = snap.get(t)
-        lines.append(seat_line(t, s) if s else f"<b>#{h(t)}</b> · not on the network")
+        if not s:
+            lines.append(f"<b>#{h(t)}</b> · not on the network")
+            continue
+        line = seat_line(t, s)
+        al = allocations_for(s["wallet"])
+        if al:
+            un = sum(1 for _, a in al if a.get("claimed") is False)
+            line += f" · allocations {len(al)}" + (f" (<b>{un} unclaimed</b>)" if un else "")
+        lines.append(line)
     lines.append(network_line())
     send(chat_id, "\n".join(lines), keys=True)
 
@@ -432,6 +559,82 @@ def digest(now):
         lines.append(network_line())
         send(chat_id, "\n".join(lines), silent=True)
 
+# ---------- allocations (from the Swarm Ledger snapshot) ----------
+def check_allocations():
+    try:
+        load_ledger()
+    except Exception as e:
+        last_err["ledger"] = str(e)[:200]
+        log("ledger failed", e)
+        return False
+    if not kv_get("alloc_init"):  # first run: remember what exists, announce nothing
+        with db() as c:
+            for r in c.execute("SELECT chat_id, token_id FROM subs").fetchall():
+                prime_allocs(r["chat_id"], r["token_id"])
+        kv_set("alloc_init", "1")
+        return True
+    for w, subs in watched_wallets().items():
+        for l, a in allocations_for(w):
+            n = int(l["number"])
+            claimed = 1 if a.get("claimed") is True else 0
+            for chat_id, t in subs:
+                with db() as c:
+                    r = c.execute("SELECT claimed FROM alloc_seen WHERE chat_id=? AND launch=? AND wallet=?", (chat_id, n, w)).fetchone()
+                if r is None:
+                    send(chat_id, f"🎁 <b>#{h(t)}</b> got a launch allocation:\n{alloc_line(l, a)}")
+                elif claimed and not r["claimed"]:
+                    send(chat_id, f"✅ <b>#{h(t)}</b> claimed its allocation from launch No. {n:04d} {h((l.get('token') or {}).get('symbol') or '')}.", silent=True)
+                else:
+                    continue
+                with db() as c:
+                    c.execute("INSERT OR REPLACE INTO alloc_seen VALUES (?,?,?,?)", (chat_id, n, w, claimed))
+    return True
+
+# ---------- IMD arriving in watched wallets ----------
+DROPS_PER_CYCLE = 10
+_drops_cursor = 0
+
+def check_drops():
+    """Round-robin over watched wallets, a few per minute: read each wallet's latest incoming
+    IMD transfers from the explorer and report the ones not seen before. A wallet seen for the
+    first time is primed silently, so old history is never announced as news.
+    (The token's global transfer feed is too busy to walk; per-wallet reads stay O(1) each.)"""
+    global _drops_cursor
+    watched = watched_wallets()
+    wallets = sorted(watched)
+    if not wallets:
+        return True
+    batch = [wallets[(_drops_cursor + i) % len(wallets)] for i in range(min(DROPS_PER_CYCLE, len(wallets)))]
+    _drops_cursor = (_drops_cursor + len(batch)) % len(wallets)
+    ok = True
+    for w in batch:
+        try:
+            d = get_json(f"{BLOCKSCOUT}/addresses/{w}/token-transfers?type=ERC-20&filter=to&token={IMD}")
+        except Exception as e:
+            last_err["drops"] = str(e)[:200]
+            log("drops fetch failed", w[:10], e)
+            ok = False
+            continue
+        items = [x for x in d.get("items", []) if ((x.get("to") or {}).get("hash") or "").lower() == w]
+        primed = kv_get(f"drops_primed:{w}")
+        with db() as c:
+            for x in items:
+                txh = x["transaction_hash"]
+                if c.execute("SELECT 1 FROM drops_seen WHERE tx=? AND wallet=?", (txh, w)).fetchone():
+                    continue
+                c.execute("INSERT INTO drops_seen VALUES (?,?,?)", (txh, w, int(time.time())))
+                if not primed:
+                    continue
+                frm = x.get("from") or {}
+                src = frm.get("name") or (frm.get("hash") or "")[:6] + "…"
+                amount = fmt_amount(x["total"]["value"], x["total"].get("decimals", 18))
+                for chat_id, t in watched[w]:
+                    send(chat_id, f"💸 <b>+{amount} IMD</b> arrived in the wallet of <b>#{h(t)}</b> · from {h(src)}"
+                                  f" · <a href=\"https://etherscan.io/tx/{h(txh)}\">tx</a>")
+        if not primed:
+            kv_set(f"drops_primed:{w}", "1")
+    return ok
+
 # ---------- on-chain messages ----------
 def poll_news():
     """Self-transactions from the collection owner whose calldata is UTF-8 text."""
@@ -479,9 +682,9 @@ def poll_news():
 
 # ---------- loops ----------
 STALE_S = 10 * 60
-last_ok = {"seats": 0, "news": 0}
-last_err = {"seats": "", "news": ""}
-stale_flag = {"seats": False, "news": False}
+last_ok = {"seats": 0, "news": 0, "drops": 0, "ledger": 0}
+last_err = {"seats": "", "news": "", "drops": "", "ledger": ""}
+stale_flag = {"seats": False, "news": False, "drops": False, "ledger": False}
 
 def watchdog(now, what, limit):
     """Tell the admin once when a data source stops updating, and once when it is back."""
@@ -497,7 +700,7 @@ def watchdog(now, what, limit):
 
 def poll_loop():
     global seats, network
-    last_news = 0
+    last_news = last_drops = last_ledger = 0
     while True:
         now = int(time.time())
         try:
@@ -528,8 +731,18 @@ def poll_loop():
             last_news = now
             if poll_news():
                 last_ok["news"] = now
+        if fresh and now - last_drops >= DROPS_POLL_S:
+            last_drops = now
+            if check_drops():
+                last_ok["drops"] = now
+        if fresh and now - last_ledger >= LEDGER_POLL_S:
+            last_ledger = now
+            if check_allocations():
+                last_ok["ledger"] = now
         watchdog(now, "seats", STALE_S)
         watchdog(now, "news", 2 * 3600)
+        watchdog(now, "drops", 2 * 3600)
+        watchdog(now, "ledger", 3 * 3600)
         time.sleep(max(1, POLL_S - (time.time() - now)))
 
 def updates_loop():
@@ -571,7 +784,7 @@ if __name__ == "__main__":
     log("swarm-watch up as @" + me["result"]["username"])
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
         ("watch", "watch NFT seats, e.g. /watch 7 1234"), ("unwatch", "stop watching"), ("list", "what you watch"),
-        ("status", "your seats right now"), ("network", "the swarm right now"), ("digest", "daily summary on|off"),
+        ("status", "your seats right now"), ("network", "the swarm right now"), ("allocations", "launch tokens allocated to your seats"), ("drops", "IMD received by your seats' wallets"), ("digest", "daily summary on|off"),
         ("news", "dev's on-chain messages on|off"), ("help", "how it works")]])
     threading.Thread(target=poll_loop, daemon=True).start()
     updates_loop()
