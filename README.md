@@ -13,6 +13,9 @@ read-only. It never asks for keys, wallets or access to anyone's machine.
 /news on|off       the dev's on-chain messages as they land
 ```
 
+Every reply carries a button bar (Status, Network, Watch, Unwatch, and toggles for the
+daily digest and dev news), so after `/start` nothing needs typing except NFT numbers.
+
 Alerts, per watched seat:
 
 - **stalled** — no work taken for 2 h while at least half the fleet took some. When the whole
@@ -30,6 +33,10 @@ Those are shown only to the node itself by `imd doctor`. For that there is
 once a minute, keeps three days of per-seat history in sqlite, and reads the collection
 owner's self-transactions from a public block explorer to relay on-chain messages. One
 process, one sqlite file, no other dependencies.
+
+If the network API stops answering for 10 minutes, or the block explorer for 2 hours, the
+bot tells its admin chat once and again when the source is back; while data is stale it
+does not raise seat alerts, since stale counts would look like silence.
 
 Seats are merged per NFT: the API lists one entry per paired device, so an NFT moved to a
 new machine appears twice there.

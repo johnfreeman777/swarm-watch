@@ -60,9 +60,10 @@ def tg(method, **params):
         log("telegram", method, "error", e)
         return {"ok": False, "description": str(e)}
 
-def send(chat_id, text, silent=False, ask=None):
-    """ask: placeholder text; opens the reply field so the user can just type an answer."""
-    extra = {"reply_markup": {"force_reply": True, "input_field_placeholder": ask}} if ask else {}
+def send(chat_id, text, silent=False, ask=None, keys=None):
+    """ask: placeholder text; opens the reply field so the user can just type an answer.
+    keys: attach the inline button bar."""
+    extra = {"reply_markup": {"force_reply": True, "input_field_placeholder": ask}} if ask else {"reply_markup": keyboard(chat_id)} if keys else {}
     r = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, disable_notification=silent, **extra)
     if not r.get("ok") and r.get("error_code") in (403, 400):  # blocked the bot or chat gone: drop them
         with db() as c:
@@ -188,6 +189,38 @@ def network_line():
     paid = f" · paid orders {n['paid']:,}" if n.get("paid") is not None else ""
     return f"network: {n.get('online')}/{n.get('enrolled')} online · {n.get('accepted24h', 0):,} accepted in 24 h · working now {n.get('working')}{paid}"
 
+def keyboard(chat_id):
+    with db() as c:
+        r = c.execute("SELECT digest, news FROM prefs WHERE chat_id=?", (chat_id,)).fetchone()
+    digest_on, news_on = (r["digest"], r["news"]) if r else (1, 1)
+    return {"inline_keyboard": [
+        [{"text": "📊 Status", "callback_data": "status"}, {"text": "🌐 Network", "callback_data": "network"}],
+        [{"text": "➕ Watch", "callback_data": "watch"}, {"text": "➖ Unwatch", "callback_data": "unwatch"}],
+        [{"text": f"{'🔔' if digest_on else '🔕'} Daily digest: {'on' if digest_on else 'off'}", "callback_data": "digest"},
+         {"text": f"{'📡' if news_on else '📴'} Dev news: {'on' if news_on else 'off'}", "callback_data": "news"}],
+    ]}
+
+def toggle(chat_id, field):
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO prefs (chat_id) VALUES (?)", (chat_id,))
+        r = c.execute(f"SELECT {field} FROM prefs WHERE chat_id=?", (chat_id,)).fetchone()
+        new = 0 if r[field] else 1
+        c.execute(f"UPDATE prefs SET {field}=? WHERE chat_id=?", (new, chat_id))
+    return new
+
+def callback(chat_id, data, cq_id, msg_id=None):
+    """Inline button presses map onto the same actions as the commands."""
+    if data in ("status", "network", "watch", "unwatch"):
+        tg("answerCallbackQuery", callback_query_id=cq_id)
+        cmd(chat_id, "/" + data)
+    elif data in ("digest", "news"):
+        new = toggle(chat_id, data)
+        tg("answerCallbackQuery", callback_query_id=cq_id, text=f"{'Daily digest' if data == 'digest' else 'Dev news'} {'on' if new else 'off'}")
+        if msg_id:  # refresh the button bar under the message that was pressed
+            tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup=keyboard(chat_id))
+    else:
+        tg("answerCallbackQuery", callback_query_id=cq_id)
+
 HELP = (
     "<b>Swarm Watch</b> · unofficial, read-only, public data only.\n\n"
     "/watch 7 1234 — watch these NFT seats\n"
@@ -237,7 +270,7 @@ def do_unwatch(chat_id, ids, everything=False):
         else:
             c.executemany("DELETE FROM subs WHERE chat_id=? AND token_id=?", [(chat_id, t) for t in ids])
             c.executemany("DELETE FROM alerts WHERE chat_id=? AND token_id=?", [(chat_id, t) for t in ids])
-    send(chat_id, "Done. You watch: " + (", ".join(f"#{t}" for t in my_subs(chat_id)) or "nothing."))
+    send(chat_id, "Done. You watch: " + (", ".join(f"#{t}" for t in my_subs(chat_id)) or "nothing."), keys=True)
 
 def parse_ids(args):
     out = []
@@ -256,7 +289,7 @@ def cmd(chat_id, text):
     with db() as c:
         c.execute("INSERT OR IGNORE INTO prefs (chat_id) VALUES (?)", (chat_id,))
     if c0 in ("/start", "/help"):
-        send(chat_id, HELP)
+        send(chat_id, HELP, keys=True)
     elif c0 == "/watch":
         ids = parse_ids(args)
         if not ids:
@@ -282,7 +315,7 @@ def cmd(chat_id, text):
     elif c0 == "/status":
         status(chat_id, my_subs(chat_id))
     elif c0 == "/network":
-        send(chat_id, network_line())
+        send(chat_id, network_line(), keys=True)
     elif c0 in ("/digest", "/news"):
         on = (args[0].lower() if args else "") in ("on", "1", "yes")
         off = (args[0].lower() if args else "") in ("off", "0", "no")
@@ -310,7 +343,7 @@ def plain(chat_id, text):
         return do_watch(chat_id, ids)
     if action == "watch":
         return send(chat_id, "I need NFT numbers, e.g. <code>7 1234</code>", ask="7 1234")
-    send(chat_id, HELP)
+    send(chat_id, HELP, keys=True)
 
 def my_subs(chat_id):
     with db() as c:
@@ -318,7 +351,7 @@ def my_subs(chat_id):
 
 def status(chat_id, ids):
     if not ids:
-        return send(chat_id, "You watch nothing yet. /watch 51")
+        return send(chat_id, "You watch nothing yet. Press Watch or type the NFT numbers.", keys=True)
     lines = []
     with net_lock:
         snap = {t: dict(seats[t]) for t in ids if t in seats}
@@ -326,7 +359,7 @@ def status(chat_id, ids):
         s = snap.get(t)
         lines.append(seat_line(t, s) if s else f"<b>#{h(t)}</b> · not on the network")
     lines.append(network_line())
-    send(chat_id, "\n".join(lines))
+    send(chat_id, "\n".join(lines), keys=True)
 
 # ---------- alerts ----------
 def alert_state(chat_id, t, kind):
@@ -405,7 +438,9 @@ def poll_news():
     try:
         data = get_json(f"{BLOCKSCOUT}/addresses/{OWNER}/transactions")
     except Exception as e:
-        return log("news fetch failed", e)
+        last_err["news"] = str(e)[:200]
+        log("news fetch failed", e)
+        return False
     items = data.get("items", [])
     seen_any = kv_get("news_init")
     new = []
@@ -428,9 +463,10 @@ def poll_news():
         new.append((tx["hash"], tx.get("timestamp"), text))
     if not seen_any:  # first run: remember everything, announce nothing
         kv_set("news_init", "1")
-        return log(f"news: primed with {len(new)} past messages")
+        log(f"news: primed with {len(new)} past messages")
+        return True
     if not new:
-        return
+        return True
     with db() as c:
         chats = [r["chat_id"] for r in c.execute("SELECT chat_id FROM prefs WHERE news=1")]
     for txh, ts, text in reversed(new):
@@ -439,8 +475,26 @@ def poll_news():
         for chat_id in chats:
             send(chat_id, msg)
         log("news: sent", txh, "to", len(chats))
+    return True
 
 # ---------- loops ----------
+STALE_S = 10 * 60
+last_ok = {"seats": 0, "news": 0}
+last_err = {"seats": "", "news": ""}
+stale_flag = {"seats": False, "news": False}
+
+def watchdog(now, what, limit):
+    """Tell the admin once when a data source stops updating, and once when it is back."""
+    if not ADMIN or not last_ok[what]:
+        return
+    stale = now - last_ok[what] > limit
+    if stale and not stale_flag[what]:
+        stale_flag[what] = True
+        send(ADMIN, f"🛑 swarm-watch: no fresh {what} data for {(now - last_ok[what]) // 60} min. Last error: {h(last_err[what] or 'none')}")
+    elif not stale and stale_flag[what]:
+        stale_flag[what] = False
+        send(ADMIN, f"✅ swarm-watch: {what} data is updating again.")
+
 def poll_loop():
     global seats, network
     last_news = 0
@@ -451,7 +505,9 @@ def poll_loop():
             with net_lock:
                 seats = merged
             record(now, merged)
+            last_ok["seats"] = now
         except Exception as e:
+            last_err["seats"] = str(e)[:200]
             log("contributors failed", e)
         try:
             n = fetch_health()
@@ -459,8 +515,10 @@ def poll_loop():
                 network = n
         except Exception as e:
             log("health failed", e)
+        fresh = now - last_ok["seats"] <= STALE_S
         try:
-            check_alerts(now)
+            if fresh:  # stale counts would look like silence; don't alert on them
+                check_alerts(now)
             digest(now)
         except Exception as e:
             log("alerts failed", e)
@@ -468,19 +526,29 @@ def poll_loop():
                 send(ADMIN, f"swarm-watch alerts error: {h(e)}")
         if now - last_news >= NEWS_POLL_S:
             last_news = now
-            poll_news()
+            if poll_news():
+                last_ok["news"] = now
+        watchdog(now, "seats", STALE_S)
+        watchdog(now, "news", 2 * 3600)
         time.sleep(max(1, POLL_S - (time.time() - now)))
 
 def updates_loop():
     offset = int(kv_get("tg_offset", 0))
     while True:
-        r = tg("getUpdates", offset=offset, timeout=50, allowed_updates=["message"])
+        r = tg("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "callback_query"])
         if not r.get("ok"):
             time.sleep(5)
             continue
         for u in r.get("result", []):
             offset = u["update_id"] + 1
             kv_set("tg_offset", offset)
+            cq = u.get("callback_query")
+            if cq:
+                try:
+                    callback((cq.get("message") or {}).get("chat", {}).get("id"), cq.get("data", ""), cq["id"], (cq.get("message") or {}).get("message_id"))
+                except Exception as e:
+                    log("callback failed", e)
+                continue
             m = u.get("message") or {}
             text = m.get("text")
             chat = (m.get("chat") or {}).get("id")
