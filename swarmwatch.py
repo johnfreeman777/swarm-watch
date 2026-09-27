@@ -11,6 +11,7 @@ access to anyone's machine. Standard library only; Python 3.10+.
 Env: SWARMWATCH_TOKEN_FILE (Telegram bot token), SWARMWATCH_DB (sqlite path),
      SWARMWATCH_ADMIN (chat id that receives operational errors; optional).
 """
+import calendar
 import html
 import json
 import os
@@ -27,7 +28,8 @@ EXPLORER = "https://explorer.imd.fun"
 OWNER = "0x200e710acaa6a93bbc77146026328c40f1d60fb1"  # publishes the project's on-chain messages
 BLOCKSCOUT = "https://eth.blockscout.com/api/v2"
 IMD = "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7"          # the token airdrops arrive in (mainnet)
-LEDGER = "https://johnfreeman777.github.io/swarm-ledger/data/snapshot.json"  # launches, allocations, claim status
+LEDGER = "https://johnfreeman777.github.io/swarm-ledger/data/snapshot.json"  # launches, allocations, claim status, paid orders
+HIRE = f"{EXPLORER}/api/requests"  # paid requests: free /check preview, /capabilities price list
 DROPS_POLL_S = 60
 LEDGER_POLL_S = 30 * 60
 POLL_S = 60            # network poll
@@ -64,10 +66,11 @@ def tg(method, **params):
         log("telegram", method, "error", e)
         return {"ok": False, "description": str(e)}
 
-def send(chat_id, text, silent=False, ask=None, keys=None):
+def send(chat_id, text, silent=False, ask=None, keys=None, markup=None):
     """ask: placeholder text; opens the reply field so the user can just type an answer.
-    keys: attach the inline button bar."""
-    extra = {"reply_markup": {"force_reply": True, "input_field_placeholder": ask}} if ask else {"reply_markup": keyboard(chat_id)} if keys else {}
+    keys: attach the inline button bar. markup: any other reply_markup."""
+    extra = ({"reply_markup": {"force_reply": True, "input_field_placeholder": ask}} if ask else {"reply_markup": keyboard(chat_id)} if keys
+             else {"reply_markup": markup} if markup else {})
     r = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, disable_notification=silent, **extra)
     if not r.get("ok") and r.get("error_code") in (403, 400):  # blocked the bot or chat gone: drop them
         with db() as c:
@@ -130,7 +133,8 @@ def fetch_health():
     h = get_json(f"{API}/health")
     p = h.get("payments") or {}
     return {"online": h.get("connectedDaemons"), "enrolled": h.get("activeEnrollments"), "accepted24h": h.get("acceptedLastDay"),
-            "working": h.get("workingNow"), "paid": (p.get("orders") or {}).get("paid"), "lastPaidAt": p.get("lastPaidAt"), "build": h.get("version")}
+            "working": h.get("workingNow"), "paid": (p.get("orders") or {}).get("paid"), "lastPaidAt": p.get("lastPaidAt"), "build": h.get("version"),
+            "orders": p.get("orders") or {}, "payTo": ((p.get("gasWallet") or {}).get("address") or "").lower()}
 
 def record(now, merged):
     with db() as c:
@@ -196,10 +200,11 @@ def fmt_amount(raw, decimals=18, digits=2):
         return "?"
     return f"{v:,.{digits}f}" if v < 1000 else f"{v:,.0f}"
 
-ledger = {"launches": [], "at": 0}
+ledger = {"launches": [], "orders": None, "at": 0}
 def load_ledger():
     d = get_json(LEDGER)
     ledger["launches"] = d.get("launches", [])
+    ledger["orders"] = d.get("orders")
     ledger["at"] = int(time.time())
     return True
 
@@ -254,6 +259,7 @@ def keyboard(chat_id):
     return {"inline_keyboard": [
         [{"text": "📊 Status", "callback_data": "status"}, {"text": "🌐 Network", "callback_data": "network"}],
         [{"text": "🎁 Allocations", "callback_data": "allocations"}, {"text": "💸 IMD drops", "callback_data": "drops"}],
+        [{"text": "🧾 Paid orders", "callback_data": "orders"}, {"text": "🔎 Check a request", "callback_data": "check"}],
         [{"text": "➕ Watch", "callback_data": "watch"}, {"text": "➖ Unwatch", "callback_data": "unwatch"}],
         [{"text": f"{'🔔' if digest_on else '🔕'} Daily digest: {'on' if digest_on else 'off'}", "callback_data": "digest"},
          {"text": f"{'📡' if news_on else '📴'} Dev news: {'on' if news_on else 'off'}", "callback_data": "news"}],
@@ -269,9 +275,12 @@ def toggle(chat_id, field):
 
 def callback(chat_id, data, cq_id, msg_id=None):
     """Inline button presses map onto the same actions as the commands."""
-    if data in ("status", "network", "watch", "unwatch", "allocations", "drops"):
+    if data in ("status", "network", "watch", "unwatch", "allocations", "drops", "orders", "check"):
         tg("answerCallbackQuery", callback_query_id=cq_id)
         cmd(chat_id, "/" + data)
+    elif data.startswith("check:") and data[6:] in CHECK_KINDS:
+        tg("answerCallbackQuery", callback_query_id=cq_id)
+        ask_check(chat_id, data[6:])
     elif data in ("digest", "news"):
         new = toggle(chat_id, data)
         tg("answerCallbackQuery", callback_query_id=cq_id, text=f"{'Daily digest' if data == 'digest' else 'Dev news'} {'on' if new else 'off'}")
@@ -289,6 +298,9 @@ HELP = (
     "/network — the swarm right now\n"
     "/allocations — launch tokens allocated to your seats, claimed or not\n"
     "/drops — IMD that arrived in your seats' wallets (airdrops from the dev)\n"
+    "/orders — paid requests to the swarm (explorer.imd.fun/hire): counts, IMD paid, latest payments\n"
+    "/check report Compare … — preview for free how the swarm reads a request before you pay for it "
+    "(kinds: oracle, report, website, contracts, company, image, audio, video)\n"
     "/digest on|off — daily summary at 08:00 UTC\n"
     "/news on|off — the dev's on-chain messages as they land\n\n"
     "Alerts: a seat that took no work for 2 h while most of the fleet did; 3+ new rejections in a day; a seat that disappears from the network; "
@@ -377,6 +389,186 @@ def cmd_drops(chat_id):
             lines.append(f"  +{fmt_amount(x['total']['value'], x['total'].get('decimals', 18))} IMD · {h(src)} · {h((x.get('timestamp') or '')[:10])} · <a href=\"https://etherscan.io/tx/{h(x['transaction_hash'])}\">tx</a>")
     send(chat_id, "\n".join(lines), keys=True)
 
+# ---------- paid requests (explorer.imd.fun/hire) ----------
+def short(a):
+    return f"{a[:6]}…{a[-4:]}" if a else "?"
+
+def cmd_orders(chat_id):
+    """Counts from /health (live), latest payments from the explorer (live), totals per day
+    from the Swarm Ledger snapshot (every 30 min)."""
+    with net_lock:
+        n = dict(network)
+    o = n.get("orders") or {}
+    lines = ["<b>Paid orders</b> · requests paid in IMD at explorer.imd.fun/hire"]
+    if o:
+        lines.append(f"paid {o.get('paid', 0):,} · paying now {o.get('payment_pending', 0):,} · failed {o.get('payment_failed', 0):,}"
+                     f" · quotes left unpaid {o.get('expired', 0):,} · last paid {ago(iso_ts(n.get('lastPaidAt')))}")
+    lo = ledger.get("orders")
+    if lo:
+        lines.append(f"on chain: {fmt_amount(lo['total'])} IMD from {lo['payerCount']:,} wallets since {h(lo['first'][:10])}"
+                     f" · last 24 h {lo['lastDay']['orders']:,} orders from {lo['lastDay']['payers']:,} wallets")
+        if lo.get("held") is not None:
+            lines.append(f"the payment wallet holds {fmt_amount(lo['held'])} IMD (not passed on to seats yet)")
+        days = " · ".join(f"{h(d['day'][5:])} {d['orders']}" for d in lo.get("days", [])[:7])
+        if days:
+            lines.append(f"per day: {days}")
+    pay_to = n.get("payTo") or (lo or {}).get("wallet")
+    if pay_to:
+        try:
+            d = get_json(f"{BLOCKSCOUT}/addresses/{pay_to}/token-transfers?type=ERC-20&filter=to&token={IMD}")
+            items = [x for x in d.get("items", []) if ((x.get("to") or {}).get("hash") or "").lower() == pay_to][:5]
+            if items:
+                lines.append("latest:")
+            for x in items:
+                lines.append(f"  {fmt_amount(x['total']['value'])} IMD · {h(short((x.get('from') or {}).get('hash', '').lower()))}"
+                             f" · {ago(iso_ts(x.get('timestamp')))} · <a href=\"https://etherscan.io/tx/{h(x['transaction_hash'])}\">tx</a>")
+        except Exception as e:
+            lines.append(f"latest payments: explorer unavailable ({h(str(e)[:60])})")
+    price = hire_price()
+    lines.append(f"Price {price} per request. Preview a request for free first: /check" if price else "Preview a request for free first: /check")
+    lines.append('Per day and top payers: <a href="https://johnfreeman777.github.io/swarm-ledger/#orders">Swarm Ledger</a>')
+    send(chat_id, "\n".join(lines), keys=True)
+
+def iso_ts(s):
+    try:
+        return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+_caps = {"at": 0, "price": None}
+def hire_price():
+    """Price per request from the explorer's capabilities, cached for an hour."""
+    if time.time() - _caps["at"] > 3600:
+        try:
+            c = get_json(f"{HIRE}/capabilities", timeout=15)
+            amounts = {a["payment"]["amount"] for a in c.get("actions", []) if a.get("payment")}
+            dec = next((a["payment"].get("decimals", 18) for a in c.get("actions", []) if a.get("payment")), 18)
+            _caps["price"] = (f"{fmt_amount(min(int(x) for x in amounts), dec)} IMD" if len(amounts) == 1
+                              else f"{fmt_amount(min(int(x) for x in amounts), dec)}–{fmt_amount(max(int(x) for x in amounts), dec)} IMD") if amounts else None
+            _caps["at"] = time.time()
+        except Exception as e:
+            log("capabilities failed", e)
+    return _caps["price"]
+
+# What each kind sends to the explorer's free /check, built the same way the /hire page builds it.
+REPORT_OUT = {"research-report": ("report", "artifacts/report.md", "text/markdown"), "create-image": ("image", "artifacts/image.png", "image/png"),
+              "create-audio": ("audio", "artifacts/audio.mp3", "audio/mpeg"), "create-video": ("video", "artifacts/video.mp4", "video/mp4")}
+LAUNCH_CHAIN = 11155111  # the /hire page launches companies on Sepolia for now
+CHECK_KINDS = {
+    "oracle": ("Ask the oracle", "Will ETH close above 5000 USD on 31 Dec 2026, UTC?"),
+    "report": ("Report", "Compare the three largest restaking protocols and their slashing conditions."),
+    "website": ("Website", "A dashboard for an ERC-4626 vault: its TVL, share price and a connected wallet's position."),
+    "contracts": ("Draft contracts", "An ERC-4626 vault with a mock token and invariant tests for share accounting."),
+    "company": ("Launch a company", "A tip jar contract and a one-page site where anyone can tip and the owner can withdraw."),
+    "image": ("Image", "A warm illustration of a bakery storefront at dawn, wide, for a website hero."),
+    "audio": ("Audio", "Thirty seconds of calm narration introducing a podcast about cities."),
+    "video": ("Video", "A ten-second loop of waves at sunset, for a background."),
+}
+CHECK_INTRO = ("<b>Check a request before paying for it.</b> The explorer's free check shows how the swarm reads it: "
+               "the plan, what it will assume, and anything that blocks it. Nothing is paid and no wallet is involved; "
+               "your text is sent to explorer.imd.fun. Pick a kind:")
+CHECK_GAP_S = 20
+_check_last = {}
+
+def check_keyboard():
+    ks = list(CHECK_KINDS)
+    return {"inline_keyboard": [[{"text": CHECK_KINDS[k][0], "callback_data": f"check:{k}"} for k in ks[i:i + 2]] for i in range(0, len(ks), 2)]}
+
+def ask_check(chat_id, kind):
+    set_pending(chat_id, f"check:{kind}")
+    name, example = CHECK_KINDS[kind]
+    send(chat_id, f"<b>{h(name)}</b>: type the request as you would on the hire page.\nExample: <i>{h(example)}</i>", ask=example[:64])
+
+def check_input(kind, text):
+    if kind == "oracle":
+        return "oracle.request", {"question": text, "panelSize": 20}
+    if kind == "company":
+        return "workflow.open", {"request": text, "context": "", "draft": {
+            "objective": text[:8000], "shape": "chain", "onchain": "evm_project", "github": True, "ipfs": True,
+            "steps": [{"skill": "build-contract-project"}, {"skill": "frontend-for-contract"}, {"skill": "adversarial-review"}]},
+            "permissions": {"github": True, "ipfs": True, "onchain": {"kind": "evm_project", "chainId": LAUNCH_CHAIN}}}
+    skill = {"report": "research-report", "website": "build-website", "contracts": "build-contract-project",
+             "image": "create-image", "audio": "create-audio", "video": "create-video"}[kind]
+    inp = {"objective": text, "skill": skill, "github": True}
+    if skill == "build-website":
+        inp["ipfs"] = True
+    if skill in REPORT_OUT:
+        name, path, mt = REPORT_OUT[skill]
+        inp["outputs"] = [{"name": name, "path": path, "mediaType": mt}]
+    return "job.open", inp
+
+def start_check(chat_id, kind, text):
+    text = text.strip()[:8000]
+    if not text:
+        return ask_check(chat_id, kind)
+    wait = CHECK_GAP_S - (time.time() - _check_last.get(chat_id, 0))
+    if wait > 0:
+        return send(chat_id, f"One check at a time; try again in {int(wait) + 1} s.")
+    _check_last[chat_id] = time.time()
+    tg("sendChatAction", chat_id=chat_id, action="typing")
+    # the explorer judges the request with a model and can take a while; keep the update loop free
+    threading.Thread(target=run_check, args=(chat_id, kind, text), daemon=True).start()
+
+def run_check(chat_id, kind, text):
+    action, inp = check_input(kind, text)
+    try:
+        r = get_json(f"{HIRE}/check", data=json.dumps({"action": action, "input": inp}).encode(), timeout=90)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        msg = "The explorer is busy; try again in a minute." if e.code == 429 else f"The explorer would not check this ({e.code}): {h(body)}"
+        return send(chat_id, msg, keys=True)
+    except Exception as e:
+        log("check failed", e)
+        return send(chat_id, "Could not reach the explorer's check; try again later.", keys=True)
+    try:
+        send(chat_id, render_check(kind, r), keys=True)
+    except Exception as e:
+        log("check render failed", e, json.dumps(r)[:300])
+        send(chat_id, "The explorer answered in a shape I don't understand yet.", keys=True)
+
+ANSWER_TYPES = {"bool": "yes or no", "uint256": "a number", "bytes32": "text", "bytes32[]": "a list of text", "address": "an address", "address[]": "a list of addresses"}
+FACT_MARK = {"stated": "✓", "unknown": "·", "missing": "?"}
+ORACLE_FIELDS = {"answerType": "answer type", "evidence": "evidence source", "chainId": "chain", "toleranceBps": "tolerance", "head": "block to read at", "window": "time window"}
+BLOCKER_TEXT = {"recheck_failed": "The explorer's planner wants this revised before it will quote it, and does not say what to change. "
+                                  "Try naming every contract, who may call what, the numbers, and what the site shows."}
+
+def render_check(kind, r):
+    name = CHECK_KINDS[kind][0]
+    blockers, suggestions = r.get("blockers") or [], r.get("suggestions") or []
+    lines = [f"<b>{h(name)}</b> · " + ("❌ blocked, it would not be quoted as written" if blockers else "✅ would be quoted")]
+    if kind == "oracle":
+        q = r.get("request") or {}
+        chains = {c["id"]: c["name"] for c in r.get("chains", [])}
+        lines.append(f"Question: {h(q.get('question', ''))}")
+        lines.append(f"Answer: {h(ANSWER_TYPES.get(q.get('answerType'), q.get('answerType', '?')))} · evidence: {h(q.get('evidence', '?'))}"
+                     f" · chain: {h(chains.get(q.get('chainId'), q.get('chainId', '?')))} · panel {q.get('panelSize', '?')}, quorum {q.get('quorum', '?')}"
+                     f" · answer valid {int(q.get('validForSeconds', 0)) // 3600} h")
+        unsure = [k for k, v in (r.get("proposed") or {}).items() if isinstance(v, dict) and v.get("confidence", 1) < 0.5]
+        if unsure:
+            lines.append("Guessed with low confidence: " + ", ".join(h(ORACLE_FIELDS.get(u, u)) for u in unsure) + " (say them in the question if they matter)")
+        if r.get("online"):
+            lines.append(f"{r['online']:,} agents online")
+    else:
+        plan = [p.get("title", "") for p in r.get("plan") or []]
+        if plan:
+            lines.append("Plan: " + " → ".join(h(p) for p in plan))
+        for f in r.get("facts") or []:
+            if f.get("state") == "not_applicable":
+                continue
+            mark = "❗" if f.get("required") and f.get("state") != "stated" else FACT_MARK.get(f.get("state"), "·")
+            extra = f" — {h(f['assumed'])}" if f.get("assumed") and f.get("state") != "stated" else ""
+            lines.append(f"  {mark} {h(f.get('label', f.get('id', '')))}{extra}")
+    for b in blockers:
+        lines.append(f"❌ {h(BLOCKER_TEXT.get(b.get('code')) or b.get('detail') or b.get('code'))}")
+    if kind != "oracle":  # missing facts are already listed above with what will be assumed
+        suggestions = [x for x in suggestions if x.get("code") != "missing_fact"]
+    for s in suggestions[:4]:
+        lines.append(f"💡 {h(s.get('detail') or s.get('code'))}")
+    price = hire_price()
+    lines.append(f"\nNothing was paid. To order it: <a href=\"{EXPLORER}/hire\">explorer.imd.fun/hire</a>" + (f" · {price}" if price else ""))
+    out = "\n".join(lines)
+    return out if len(out) < 4000 else out[:3990] + "…"
+
 def do_unwatch(chat_id, ids, everything=False):
     with db() as c:
         if everything:
@@ -435,6 +627,18 @@ def cmd(chat_id, text):
         cmd_allocations(chat_id)
     elif c0 == "/drops":
         cmd_drops(chat_id)
+    elif c0 == "/orders":
+        cmd_orders(chat_id)
+    elif c0 == "/check":
+        kind = args[0].lower() if args else ""
+        if kind not in CHECK_KINDS:
+            set_pending(chat_id, None)
+            return send(chat_id, CHECK_INTRO, markup=check_keyboard())
+        text = " ".join(parts[2:]) if len(parts) > 2 else ""
+        if not text:
+            return ask_check(chat_id, kind)
+        set_pending(chat_id, None)
+        start_check(chat_id, kind, text)
     elif c0 in ("/digest", "/news"):
         on = (args[0].lower() if args else "") in ("on", "1", "yes")
         off = (args[0].lower() if args else "") in ("off", "0", "no")
@@ -451,6 +655,9 @@ def cmd(chat_id, text):
 def plain(chat_id, text):
     """Text without a slash: the answer to a /watch or /unwatch prompt, or just NFT numbers."""
     action = get_pending(chat_id)
+    if action and action.startswith("check:") and action[6:] in CHECK_KINDS:
+        set_pending(chat_id, None)
+        return start_check(chat_id, action[6:], text)
     ids = parse_ids(text.replace(",", " ").split())
     if action == "unwatch":
         set_pending(chat_id, None)
@@ -548,6 +755,9 @@ def digest(now):
         chats = [r["chat_id"] for r in c.execute("SELECT chat_id FROM prefs WHERE digest=1")]
     with net_lock:
         snap = {t: dict(s) for t, s in seats.items()}
+    o = ledger.get("orders")
+    orders_line = (f"paid orders: {o['lastDay']['orders']:,} in 24 h from {o['lastDay']['payers']:,} wallets · "
+                   f"{fmt_amount(o['total'])} IMD paid in total · /orders") if o and o.get("lastDay") else ""
     for chat_id in chats:
         ids = my_subs(chat_id)
         if not ids:
@@ -557,6 +767,8 @@ def digest(now):
             s = snap.get(t)
             lines.append(seat_line(t, s, row_at(t, now - 24 * 3600)) if s else f"<b>#{h(t)}</b> · not on the network")
         lines.append(network_line())
+        if orders_line:
+            lines.append(orders_line)
         send(chat_id, "\n".join(lines), silent=True)
 
 # ---------- allocations (from the Swarm Ledger snapshot) ----------
@@ -784,7 +996,8 @@ if __name__ == "__main__":
     log("swarm-watch up as @" + me["result"]["username"])
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
         ("watch", "watch NFT seats, e.g. /watch 7 1234"), ("unwatch", "stop watching"), ("list", "what you watch"),
-        ("status", "your seats right now"), ("network", "the swarm right now"), ("allocations", "launch tokens allocated to your seats"), ("drops", "IMD received by your seats' wallets"), ("digest", "daily summary on|off"),
+        ("status", "your seats right now"), ("network", "the swarm right now"), ("allocations", "launch tokens allocated to your seats"), ("drops", "IMD received by your seats' wallets"),
+        ("orders", "paid requests to the swarm"), ("check", "preview a request for free before paying"), ("digest", "daily summary on|off"),
         ("news", "dev's on-chain messages on|off"), ("help", "how it works")]])
     threading.Thread(target=poll_loop, daemon=True).start()
     updates_loop()

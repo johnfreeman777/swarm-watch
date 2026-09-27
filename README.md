@@ -11,12 +11,25 @@ read-only. It never asks for keys, wallets or access to anyone's machine.
 /network           the swarm right now: online, accepted in 24 h, paid orders
 /allocations       launch tokens allocated to your seats' wallets, claimed or not, with claim links
 /drops             IMD that arrived in those wallets (the dev's airdrops to active nodes)
+/orders            paid requests to the swarm (explorer.imd.fun/hire): counts, IMD paid, latest payments
+/check report …    preview for free how the swarm reads a request before paying for it
 /digest on|off     daily summary at 08:00 UTC
 /news on|off       the dev's on-chain messages as they land
 ```
 
-Every reply carries a button bar (Status, Network, Watch, Unwatch, and toggles for the
-daily digest and dev news), so after `/start` nothing needs typing except NFT numbers.
+Every reply carries a button bar (Status, Network, Allocations, IMD drops, Paid orders,
+Check a request, Watch, Unwatch, and toggles for the daily digest and dev news), so after
+`/start` nothing needs typing except NFT numbers.
+
+**Before paying for a request.** `/check` sends the text to the explorer's free check
+endpoint (the same one the hire page uses) and shows how the swarm reads it: the plan, each
+fact it found or will assume, and anything that blocks a quote. Kinds: `oracle`, `report`,
+`website`, `contracts`, `company`, `image`, `audio`, `video`; bare `/check` offers buttons.
+Nothing is paid and no wallet is involved. One check per chat every 20 s.
+
+**Paid orders.** `/orders` combines the live counts from `/health`, the latest payments into
+the hire page's payment wallet (read from a public explorer) and the per-day totals from the
+Swarm Ledger snapshot. The daily digest adds one line with orders in the last 24 h.
 
 Alerts, per watched seat:
 
