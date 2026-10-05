@@ -13,12 +13,15 @@ read-only. It never asks for keys, wallets or access to anyone's machine.
 /drops             IMD that arrived in those wallets (the dev's airdrops to active nodes)
 /orders            paid requests to the swarm (explorer.imd.fun/hire): counts, IMD paid, latest payments
 /check report …    preview for free how the swarm reads a request before paying for it
+/launches          tokens and contracts launched on Ethereum mainnet through the swarm
+/launches on|off   alerts for new mainnet launches (on by default)
 /digest on|off     daily summary at 08:00 UTC
 /news on|off       the dev's on-chain messages as they land
 ```
 
 Every reply carries a button bar (Status, Network, Allocations, IMD drops, Paid orders,
-Check a request, Watch, Unwatch, and toggles for the daily digest and dev news), so after
+Check a request, Mainnet launches, Watch, Unwatch, and toggles for launch alerts, the daily
+digest and dev news), so after
 `/start` nothing needs typing except NFT numbers.
 
 **Before paying for a request.** `/check` sends the text to the explorer's free check
@@ -30,6 +33,17 @@ Nothing is paid and no wallet is involved. One check per chat every 20 s.
 **Paid orders.** `/orders` combines the live counts from `/health`, the latest payments into
 the hire page's payment wallet (read from a public explorer) and the per-day totals from the
 Swarm Ledger snapshot. The daily digest adds one line with orders in the last 24 h.
+
+**Mainnet launches.** Anyone can launch a token on Ethereum through the swarm for one paid
+request, under any name: the swarm reviews the code, not the name. The bot reads
+`api.imd.fun/launches` every 2 minutes and announces each mainnet launch once it is live:
+name and ticker, kind, pair, opening value, share of supply in the pool, pool fee, contract
+addresses, source repo, explorer job and the launching wallet. A launch whose name or ticker
+matches IMD (including `sIMD`, `Identity.md`, FWA) or any earlier mainnet launch, after folding
+case, punctuation, `0/O`, `1/l/I` and Cyrillic look-alikes, is flagged with the address of
+the original and arrives with sound; the rest arrive silently. Launches that existed before
+the bot first ran are listed by `/launches` but never announced. The daily digest adds a line
+with the last 24 hours.
 
 Alerts, per watched seat:
 

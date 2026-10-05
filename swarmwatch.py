@@ -19,6 +19,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,7 @@ LEDGER = "https://johnfreeman777.github.io/swarm-ledger/data/snapshot.json"  # l
 HIRE = f"{EXPLORER}/api/requests"  # paid requests: free /check preview, /capabilities price list
 DROPS_POLL_S = 60
 LEDGER_POLL_S = 30 * 60
+LAUNCHES_POLL_S = 120
 POLL_S = 60            # network poll
 NEWS_POLL_S = 120      # on-chain messages poll
 WINDOW_S = 2 * 3600    # "stalled" window
@@ -98,7 +100,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS pending (chat_id INTEGER PRIMARY KEY, action TEXT, ts INTEGER);
         CREATE TABLE IF NOT EXISTS drops_seen (tx TEXT, wallet TEXT, ts INTEGER, PRIMARY KEY (tx, wallet));
         CREATE TABLE IF NOT EXISTS alloc_seen (chat_id INTEGER, launch INTEGER, wallet TEXT, claimed INTEGER, PRIMARY KEY (chat_id, launch, wallet));
+        CREATE TABLE IF NOT EXISTS launches (number INTEGER PRIMARY KEY, id TEXT, kind TEXT, name TEXT, symbol TEXT, token TEXT, pair TEXT, cap TEXT,
+                                             pool_fee INTEGER, requester TEXT, job TEXT, repo TEXT, flag TEXT, live_at INTEGER, contracts TEXT);
         """)
+        try:  # added after launch; existing chats get mainnet launch alerts too
+            c.execute("ALTER TABLE prefs ADD COLUMN launches INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
 
 def kv_get(k, default=None):
     with db() as c:
@@ -254,12 +262,14 @@ def network_line():
 
 def keyboard(chat_id):
     with db() as c:
-        r = c.execute("SELECT digest, news FROM prefs WHERE chat_id=?", (chat_id,)).fetchone()
-    digest_on, news_on = (r["digest"], r["news"]) if r else (1, 1)
+        r = c.execute("SELECT digest, news, launches FROM prefs WHERE chat_id=?", (chat_id,)).fetchone()
+    digest_on, news_on, launches_on = (r["digest"], r["news"], r["launches"]) if r else (1, 1, 1)
     return {"inline_keyboard": [
         [{"text": "📊 Status", "callback_data": "status"}, {"text": "🌐 Network", "callback_data": "network"}],
         [{"text": "🎁 Allocations", "callback_data": "allocations"}, {"text": "💸 IMD drops", "callback_data": "drops"}],
         [{"text": "🧾 Paid orders", "callback_data": "orders"}, {"text": "🔎 Check a request", "callback_data": "check"}],
+        [{"text": "🚀 Mainnet launches", "callback_data": "launches"},
+         {"text": f"{'🛰' if launches_on else '📴'} Launch alerts: {'on' if launches_on else 'off'}", "callback_data": "launchalerts"}],
         [{"text": "➕ Watch", "callback_data": "watch"}, {"text": "➖ Unwatch", "callback_data": "unwatch"}],
         [{"text": f"{'🔔' if digest_on else '🔕'} Daily digest: {'on' if digest_on else 'off'}", "callback_data": "digest"},
          {"text": f"{'📡' if news_on else '📴'} Dev news: {'on' if news_on else 'off'}", "callback_data": "news"}],
@@ -275,15 +285,17 @@ def toggle(chat_id, field):
 
 def callback(chat_id, data, cq_id, msg_id=None):
     """Inline button presses map onto the same actions as the commands."""
-    if data in ("status", "network", "watch", "unwatch", "allocations", "drops", "orders", "check"):
+    if data in ("status", "network", "watch", "unwatch", "allocations", "drops", "orders", "check", "launches"):
         tg("answerCallbackQuery", callback_query_id=cq_id)
         cmd(chat_id, "/" + data)
     elif data.startswith("check:") and data[6:] in CHECK_KINDS:
         tg("answerCallbackQuery", callback_query_id=cq_id)
         ask_check(chat_id, data[6:])
-    elif data in ("digest", "news"):
-        new = toggle(chat_id, data)
-        tg("answerCallbackQuery", callback_query_id=cq_id, text=f"{'Daily digest' if data == 'digest' else 'Dev news'} {'on' if new else 'off'}")
+    elif data in ("digest", "news", "launchalerts"):
+        field = "launches" if data == "launchalerts" else data
+        new = toggle(chat_id, field)
+        label = {"digest": "Daily digest", "news": "Dev news", "launches": "Mainnet launch alerts"}[field]
+        tg("answerCallbackQuery", callback_query_id=cq_id, text=f"{label} {'on' if new else 'off'}")
         if msg_id:  # refresh the button bar under the message that was pressed
             tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup=keyboard(chat_id))
     else:
@@ -301,10 +313,12 @@ HELP = (
     "/orders — paid requests to the swarm (explorer.imd.fun/hire): counts, IMD paid, latest payments\n"
     "/check report Compare … — preview for free how the swarm reads a request before you pay for it "
     "(kinds: oracle, report, website, contracts, company, image, audio, video)\n"
+    "/launches — tokens and contracts launched on Ethereum mainnet through the swarm; /launches on|off for alerts\n"
     "/digest on|off — daily summary at 08:00 UTC\n"
     "/news on|off — the dev's on-chain messages as they land\n\n"
     "Alerts: a seat that took no work for 2 h while most of the fleet did; 3+ new rejections in a day; a seat that disappears from the network; "
-    "a new launch allocation to your seat's wallet (and when it is claimed); IMD arriving in that wallet. "
+    "a new launch allocation to your seat's wallet (and when it is claimed); IMD arriving in that wallet; "
+    "every new mainnet launch, with a loud warning when its name or ticker copies IMD or an earlier launch. "
     "Pauses and failure reasons are only visible to the node itself (imd doctor); this bot infers from public counts.\n"
     "Source: github.com/johnfreeman777/swarm-watch"
 )
@@ -435,9 +449,10 @@ def iso_ts(s):
     except Exception:
         return None
 
-_caps = {"at": 0, "price": None}
-def hire_price():
-    """Price per request from the explorer's capabilities, cached for an hour."""
+ZERO = "0x" + "0" * 40
+_caps = {"at": 0, "price": None, "pairs": {ZERO: "ETH", IMD: "IMD"}}
+def load_caps():
+    """Price per request and the launch pair currencies from the explorer's capabilities, cached for an hour."""
     if time.time() - _caps["at"] > 3600:
         try:
             c = get_json(f"{HIRE}/capabilities", timeout=15)
@@ -445,10 +460,17 @@ def hire_price():
             dec = next((a["payment"].get("decimals", 18) for a in c.get("actions", []) if a.get("payment")), 18)
             _caps["price"] = (f"{fmt_amount(min(int(x) for x in amounts), dec)} IMD" if len(amounts) == 1
                               else f"{fmt_amount(min(int(x) for x in amounts), dec)}–{fmt_amount(max(int(x) for x in amounts), dec)} IMD") if amounts else None
+            for ch in (c.get("launches") or {}).get("chains", []):
+                for p in ch.get("pairings", []):
+                    if p.get("currency") and p.get("symbol"):
+                        _caps["pairs"][p["currency"].lower()] = p["symbol"]
             _caps["at"] = time.time()
         except Exception as e:
             log("capabilities failed", e)
-    return _caps["price"]
+    return _caps
+
+def hire_price():
+    return load_caps()["price"]
 
 # What each kind sends to the explorer's free /check, built the same way the /hire page builds it.
 REPORT_OUT = {"research-report": ("report", "artifacts/report.md", "text/markdown"), "create-image": ("image", "artifacts/image.png", "image/png"),
@@ -639,9 +661,11 @@ def cmd(chat_id, text):
             return ask_check(chat_id, kind)
         set_pending(chat_id, None)
         start_check(chat_id, kind, text)
-    elif c0 in ("/digest", "/news"):
+    elif c0 in ("/digest", "/news", "/launches"):
         on = (args[0].lower() if args else "") in ("on", "1", "yes")
         off = (args[0].lower() if args else "") in ("off", "0", "no")
+        if c0 == "/launches" and not (on or off):
+            return cmd_launches(chat_id)
         if not (on or off):
             with db() as c:
                 r = c.execute("SELECT digest, news FROM prefs WHERE chat_id=?", (chat_id,)).fetchone()
@@ -758,6 +782,10 @@ def digest(now):
     o = ledger.get("orders")
     orders_line = (f"paid orders: {o['lastDay']['orders']:,} in 24 h from {o['lastDay']['payers']:,} wallets · "
                    f"{fmt_amount(o['total'])} IMD paid in total · /orders") if o and o.get("lastDay") else ""
+    with db() as c:
+        rows = c.execute("SELECT flag FROM launches WHERE live_at >= ?", (now - 24 * 3600,)).fetchall()
+    launches_line = (f"mainnet launches: {len(rows)} in 24 h" + (f", ⚠️ {sum(1 for r in rows if r['flag'])} look-alike" if any(r["flag"] for r in rows) else "")
+                     + " · /launches") if rows else ""
     for chat_id in chats:
         ids = my_subs(chat_id)
         if not ids:
@@ -769,6 +797,8 @@ def digest(now):
         lines.append(network_line())
         if orders_line:
             lines.append(orders_line)
+        if launches_line:
+            lines.append(launches_line)
         send(chat_id, "\n".join(lines), silent=True)
 
 # ---------- allocations (from the Swarm Ledger snapshot) ----------
@@ -847,6 +877,171 @@ def check_drops():
             kv_set(f"drops_primed:{w}", "1")
     return ok
 
+# ---------- mainnet launches ----------
+# Anyone can launch a token on Ethereum through the swarm for one paid request, under any name.
+# The swarm checks the code, not the name, so a launch can reuse the protocol's own ticker
+# (No. 0739 on 5 Oct 2026 was a token called IMD). Every new live mainnet launch is announced,
+# and one that reuses a known name or ticker is flagged with the address of the original.
+LOOKALIKE = str.maketrans({"0": "o", "1": "i", "l": "i", "|": "i", "!": "i", "$": "s", "@": "a",
+                           "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y",
+                           "і": "i", "ı": "i", "ӏ": "i", "м": "m", "д": "d", "ԁ": "d"})
+def norm(s):
+    """Compare names as a reader sees them: case, spacing, punctuation, digits and Cyrillic look-alikes folded."""
+    s = unicodedata.normalize("NFKC", s or "").lower().translate(LOOKALIKE)
+    return "".join(ch for ch in s if ch.isalnum())
+
+# name or ticker (normalised) -> what it belongs to and where the real one lives
+PROTECTED = {norm(k): v for k, v in {
+    "IMD": ("the protocol's IMD token", IMD), "Identity.md": ("the protocol's IMD token", IMD),
+    "IdentityMD": ("the protocol's IMD token", IMD), "sIMD": ("staked IMD", None),
+    "FWA": ("Fake World Assets, a launch pair", "0xa0df17b5ac76ababa36e1450e2cbcd18a620c845"),
+    "Fake World Assets": ("Fake World Assets, a launch pair", "0xa0df17b5ac76ababa36e1450e2cbcd18a620c845"),
+}.items()}
+
+def lookalike(number, name, symbol):
+    """Why this name or ticker could pass for something else, or None."""
+    keys = {k for k in (norm(name), norm(symbol)) if k}
+    for k in keys:
+        if k in PROTECTED:
+            what, addr = PROTECTED[k]
+            return f"Same name as {what}. This is a different token" + (f"; the real one is <code>{addr}</code>." if addr else ".")
+    with db() as c:
+        earlier = c.execute("SELECT number, name, symbol, token FROM launches WHERE number < ? AND token IS NOT NULL ORDER BY number", (number,)).fetchall()
+    for e in earlier:
+        if keys & {norm(e["name"]), norm(e["symbol"])} - {""}:
+            return (f"Same name as mainnet launch No. {e['number']:04d} {h(e['name'] or '')} ({h(e['symbol'] or '')}), "
+                    f"which came first: <code>{h(e['token'])}</code>.")
+    if any("imd" in k or "identity" in k for k in keys):
+        return f"The name looks like IMD's. It is not the protocol's token; the real IMD is <code>{IMD}</code>."
+    return None
+
+def fetch_launch(item):
+    """One live mainnet launch from the list item plus its detail: what a reader needs to tell it apart."""
+    d = get_json(f"{API}/launches/{item['id']}")
+    man = (d.get("attestation") or {}).get("manifest") or {}
+    tok = man.get("token") or {}
+    art = {a.get("role"): a for a in item.get("artifacts") or []}
+    pool = man.get("pool") or {}
+    pair = (pool.get("pairedCurrency") or "").lower() or None
+    eco = d.get("economics") or man.get("economics") or {}
+    jobs = d.get("jobs") or []
+    others = [a for a in item.get("artifacts") or [] if a.get("role") not in ("token", "distributor") and
+              not (a.get("role") == "hook" and a.get("name") == "PoolInitializationGuard")]  # the platform's own pool guard
+    return {"number": int(item["launchNumber"]), "id": item["id"], "kind": item.get("kind"),
+            "name": tok.get("name") or (art.get("token") or {}).get("name"), "symbol": tok.get("symbol"),
+            "token": (art.get("token") or {}).get("address"), "pair": pair,
+            "cap": eco.get("initialMarketCapWei"), "pool_fee": d.get("poolFee"),
+            "requester": (d.get("requester") or eco.get("remainderTo") or "").lower() or None,
+            "job": jobs[0]["id"] if jobs else None, "repo": item.get("sourceRepoUrl"),
+            "contracts": json.dumps([[a.get("role"), a.get("name"), a.get("address")] for a in others]),
+            "pool_bps": eco.get("poolBps")}
+
+def etherscan(addr, label=None):
+    return f'<a href="https://etherscan.io/address/{h(addr)}">{h(label or short(addr))}</a>'
+
+def launch_title(l):
+    if l["token"]:
+        return f"{h(l['name'] or '?')} ({h(l['symbol'] or '?')})"
+    names = [x[1] for x in json.loads(l["contracts"] or "[]")]
+    return "contracts only: " + h(", ".join(names[:4]) or "?")
+
+def launch_message(l, pool_bps=None):
+    lines = [f"🚀 <b>New mainnet launch No. {l['number']:04d}</b> · {launch_title(l)}"]
+    if l["flag"]:
+        lines.append(f"⚠️ <b>Look-alike.</b> {l['flag']}")
+    facts = [h(KIND_TEXT.get(l["kind"], l["kind"] or "?"))]
+    pair = load_caps()["pairs"].get(l["pair"] or "", short(l["pair"])) if l["pair"] else None
+    if pair:
+        facts.append(f"paired with {h(pair)}")
+    if l["cap"] and pair:
+        facts.append(f"opening value {fmt_amount(l['cap'])} {h(pair)}")
+    if pool_bps:
+        facts.append(f"{int(pool_bps) / 100:g}% of supply in the pool")
+    if l["pool_fee"]:
+        facts.append(f"pool fee {int(l['pool_fee']) / 10000:g}%")
+    lines.append(" · ".join(facts))
+    links = []
+    if l["token"]:
+        links.append("token " + etherscan(l["token"]))
+    for role, name, addr in json.loads(l["contracts"] or "[]"):
+        links.append(f"{h(name or role)} {etherscan(addr)}")
+    if l["repo"]:
+        links.append(f'<a href="{h(l["repo"])}">source</a>')
+    if l["job"]:
+        links.append(f'<a href="{EXPLORER}/jobs/{h(l["job"])}">explorer</a>')
+    if l["requester"]:
+        links.append(f"launched by {etherscan(l['requester'])}")
+    lines.append(" · ".join(links))
+    lines.append("<i>Anyone can launch here for one paid request. The swarm reviews the code, not the project or its name. Not advice.</i>")
+    return "\n".join(lines)
+
+KIND_TEXT = {"custom_token": "token", "evm_project": "token + contracts", "univ4_hook": "token + Uniswap v4 hook", "evm_contracts": "contracts, no token"}
+
+def check_launches():
+    """Announce each mainnet launch once it is live, oldest first so look-alikes compare
+    against what came before. The first run records what exists and announces nothing."""
+    try:
+        items = get_json(f"{API}/launches?limit=100").get("launches", [])
+    except Exception as e:
+        last_err["launches"] = str(e)[:200]
+        log("launches failed", e)
+        return False
+    with db() as c:
+        known = {r["number"] for r in c.execute("SELECT number FROM launches")}
+    new = sorted((x for x in items if x.get("chainId") == 1 and x.get("status") == "live" and int(x["launchNumber"]) not in known),
+                 key=lambda x: int(x["launchNumber"]))
+    priming = not kv_get("launches_init")
+    ok = True
+    for item in new:
+        try:
+            l = fetch_launch(item)
+        except Exception as e:  # the detail answers 503 'busy' at times: retry next round
+            last_err["launches"] = str(e)[:200]
+            log("launch detail failed", item.get("launchNumber"), e)
+            ok = False
+            break  # keep the order: a later launch must not be judged before an earlier one is recorded
+        pool_bps = l.pop("pool_bps")
+        l["flag"] = lookalike(l["number"], l["name"], l["symbol"]) if l["token"] else None
+        l["live_at"] = iso_ts(item.get("updatedAt")) or int(time.time())  # it turned live at its last update
+        with db() as c:
+            c.execute("INSERT OR REPLACE INTO launches VALUES (:number,:id,:kind,:name,:symbol,:token,:pair,:cap,:pool_fee,:requester,:job,:repo,:flag,:live_at,:contracts)", l)
+        if priming:
+            continue
+        with db() as c:
+            chats = [r["chat_id"] for r in c.execute("SELECT chat_id FROM prefs WHERE launches=1")]
+        msg = launch_message(l, pool_bps)
+        for chat_id in chats:
+            send(chat_id, msg, silent=not l["flag"])  # look-alikes ring, the rest arrive quietly
+        log("launch: announced", l["number"], "flagged" if l["flag"] else "", "to", len(chats))
+    if priming and ok:
+        kv_set("launches_init", "1")
+        log(f"launches: primed with {len(new)} live mainnet launches")
+    return ok
+
+def cmd_launches(chat_id):
+    with db() as c:
+        rows = c.execute("SELECT * FROM launches ORDER BY number DESC LIMIT 10").fetchall()
+        r = c.execute("SELECT launches FROM prefs WHERE chat_id=?", (chat_id,)).fetchone()
+    on = r["launches"] if r else 1
+    lines = ["<b>Mainnet launches</b> · live on Ethereum through the swarm, newest first"]
+    if not rows:
+        lines.append("none seen yet")
+    pairs = load_caps()["pairs"]
+    for l in rows:
+        line = f"No. {l['number']:04d} {launch_title(l)}"
+        if l["pair"]:
+            pair = pairs.get(l["pair"], short(l["pair"]))
+            line += f" · paired with {h(pair)}" + (f", opened at {fmt_amount(l['cap'])} {h(pair)}" if l["cap"] else "")
+        line += f" · {ago(l['live_at'])}"
+        if l["token"]:
+            line += " · " + etherscan(l["token"], "token")
+        if l["flag"]:
+            line += " · ⚠️ <b>look-alike</b>"
+        lines.append(line)
+    lines.append(f"Alerts for new ones: {'on' if on else 'off'} (/launches {'off' if on else 'on'}). "
+                 f"Look-alikes of IMD or of an earlier launch are flagged. The real IMD is <code>{IMD}</code>.")
+    send(chat_id, "\n".join(lines), keys=True)
+
 # ---------- on-chain messages ----------
 def poll_news():
     """Self-transactions from the collection owner whose calldata is UTF-8 text."""
@@ -894,9 +1089,9 @@ def poll_news():
 
 # ---------- loops ----------
 STALE_S = 10 * 60
-last_ok = {"seats": 0, "news": 0, "drops": 0, "ledger": 0}
-last_err = {"seats": "", "news": "", "drops": "", "ledger": ""}
-stale_flag = {"seats": False, "news": False, "drops": False, "ledger": False}
+last_ok = {"seats": 0, "news": 0, "drops": 0, "ledger": 0, "launches": 0}
+last_err = {"seats": "", "news": "", "drops": "", "ledger": "", "launches": ""}
+stale_flag = {"seats": False, "news": False, "drops": False, "ledger": False, "launches": False}
 
 def watchdog(now, what, limit):
     """Tell the admin once when a data source stops updating, and once when it is back."""
@@ -912,7 +1107,7 @@ def watchdog(now, what, limit):
 
 def poll_loop():
     global seats, network
-    last_news = last_drops = last_ledger = 0
+    last_news = last_drops = last_ledger = last_launches = 0
     while True:
         now = int(time.time())
         try:
@@ -951,10 +1146,19 @@ def poll_loop():
             last_ledger = now
             if check_allocations():
                 last_ok["ledger"] = now
+        if now - last_launches >= LAUNCHES_POLL_S:
+            last_launches = now
+            try:
+                if check_launches():
+                    last_ok["launches"] = now
+            except Exception as e:
+                last_err["launches"] = str(e)[:200]
+                log("launches check failed", e)
         watchdog(now, "seats", STALE_S)
         watchdog(now, "news", 2 * 3600)
         watchdog(now, "drops", 2 * 3600)
         watchdog(now, "ledger", 3 * 3600)
+        watchdog(now, "launches", 2 * 3600)
         time.sleep(max(1, POLL_S - (time.time() - now)))
 
 def updates_loop():
@@ -997,7 +1201,8 @@ if __name__ == "__main__":
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
         ("watch", "watch NFT seats, e.g. /watch 7 1234"), ("unwatch", "stop watching"), ("list", "what you watch"),
         ("status", "your seats right now"), ("network", "the swarm right now"), ("allocations", "launch tokens allocated to your seats"), ("drops", "IMD received by your seats' wallets"),
-        ("orders", "paid requests to the swarm"), ("check", "preview a request for free before paying"), ("digest", "daily summary on|off"),
+        ("orders", "paid requests to the swarm"), ("check", "preview a request for free before paying"),
+        ("launches", "mainnet launches; /launches on|off for alerts"), ("digest", "daily summary on|off"),
         ("news", "dev's on-chain messages on|off"), ("help", "how it works")]])
     threading.Thread(target=poll_loop, daemon=True).start()
     updates_loop()
